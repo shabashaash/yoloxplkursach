@@ -50,6 +50,7 @@ class MosaicDetection(Dataset):
 
     # @Dataset.mosaic_getitem
     def __getitem__(self, idx):
+        idx_ann = self._dataset.ids[idx]
         if random.random() < self.mosaic_prob:
             mosaic_labels = []
             img_size = self._dataset.img_size
@@ -63,7 +64,7 @@ class MosaicDetection(Dataset):
             indices = [idx] + [random.randint(0, len(self._dataset) - 1) for _ in range(3)]
 
             for i_mosaic, index in enumerate(indices):
-                _labels, _, _, img_name = self._dataset.annotations[index]
+                _labels, _, _, img_name = self._dataset.annotations[self._dataset.ids[index]]
                 if self._dataset.imgs is not None:
                     img = self._dataset.imgs[index]
                 else:
@@ -125,7 +126,7 @@ class MosaicDetection(Dataset):
             return mix_img, padded_labels, img_info, np.array([idx]), img_name
 
         else:
-            res, img_hw, resized_info, img_name = self._dataset.annotations[idx]
+            res, img_hw, resized_info, img_name = self._dataset.annotations[idx_ann]
             self._dataset.img_size = self.img_size
             if self._dataset.imgs is not None:
                 img = self._dataset.imgs[idx]

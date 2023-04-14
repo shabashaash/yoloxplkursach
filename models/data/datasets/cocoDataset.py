@@ -31,18 +31,20 @@ class COCODataset(Dataset):
         self.preprocess = preprocess
         self.json_file = name + ".json"
 
-        self.coco = COCO(os.path.join(self.data_dir, "annotations", self.json_file))
+        self.coco = COCO(os.path.join(self.data_dir, self.json_file))
         self.ids = self.coco.getImgIds()
         self.class_ids = sorted(self.coco.getCatIds())
         self.annotations = self._load_coco_annotations()
+        #print(self.annotations)
         self.imgs = None
         if cache:
             self._cache_images()
         else:
+            #print(self.ids)
             self.imgs = self._load_imgs()
         # Background imgs and blocks
         self.back_blocks, self.back_cls, self.object_cls = getBackground(
-            self.imgs, self.annotations, self.class_ids)
+            self.imgs, list(self.annotations.values()), self.class_ids)
 
     def __len__(self):
         return len(self.ids)
@@ -63,7 +65,7 @@ class COCODataset(Dataset):
 
         # Read annotation from self
         id_ = self.ids[index]
-        res, img_hw, resized_info, img_name = self.annotations[index]
+        res, img_hw, resized_info, img_name = self.annotations[id_]
         # load image from file
         if self.imgs is not None:
             img = self.imgs[index]
@@ -78,7 +80,7 @@ class COCODataset(Dataset):
         return img, target, img_hw, np.array([id_]), img_name
 
     def _load_coco_annotations(self):
-        return [self.load_anno_from_id(_id) for _id in self.ids]
+        return {_id:self.load_anno_from_id(_id) for _id in self.ids}
 
     def load_anno_from_id(self, id_):
         im_ann = self.coco.loadImgs([id_])[0]  # im_ann: [file_name, height, width, id]
@@ -132,8 +134,12 @@ class COCODataset(Dataset):
         return resized_img
 
     def load_image(self, index):
+        #print(index)
+        #print(self.annotations[index], 'fn'*10)
         file_name = self.annotations[index][3]
-        img_file = os.path.join(self.data_dir, self.name, file_name)
+        
+        img_file = os.path.join('/kaggle/input/prwv16/frames', file_name)
+        #print(img_file, 'here'*10)
         img = cv2.imread(img_file)
         assert img is not None, f'The problem image is {file_name}'
         return img
