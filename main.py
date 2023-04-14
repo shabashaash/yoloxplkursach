@@ -5,6 +5,7 @@ import pytorch_lightning as pl
 
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning import LightningModule
 
 from models.OneStage import OneStageD
 from models.darknet_csp import CSPDarkNet
@@ -16,7 +17,6 @@ from models.evaluators.coco import COCOEvaluator, convert_to_coco_format
 from models.utils.ema import ModelEMA
 from torch.optim import SGD, AdamW, Adam
 from models.lr_scheduler import CosineWarmupScheduler
-from nni.compression.pytorch.utils.counter import count_flops_params
 
 from torch.utils.data import DataLoader
 from models.data.datasets.cocoDataset import COCODataset
@@ -64,7 +64,7 @@ class PRWDataModule(pl.LightningDataModule):
             name=self.train_dir,
             img_size=self.img_size_train,
             preprocess=TrainTransform(max_labels=50, flip_prob=self.flip_prob, hsv_prob=self.hsv_prob),
-            cache=True
+            cache=False
         )
         self.dataset_train = MosaicDetection(
             self.dataset_train,
@@ -93,20 +93,11 @@ class PRWDataModule(pl.LightningDataModule):
             name=self.val_dir,
             img_size=self.img_size_val,
             preprocess=ValTransform(legacy=False),
-            cache=True,
+            cache=False,
         )
         val_loader = DataLoader(self.dataset_val, batch_size=self.val_batch_size, sampler=torch.utils.data.SequentialSampler(self.dataset_val),
                                 num_workers=6, pin_memory=True, shuffle=False)
         return val_loader
-
-
-
-
-
-
-
-def model_summary(model, train_size):
-    return count_flops_params(model, torch.zeros(1, 3, train_size[0], train_size[1]))
 
 
 class YOLOXLit(LightningModule):
@@ -155,7 +146,6 @@ class YOLOXLit(LightningModule):
     def on_train_start(self) -> None:
         if self.ema is True:
             self.ema_model = ModelEMA(self.model, 0.9998)
-        model_summary(self.model, self.img_size_train)
 
     def training_step(self, batch, batch_idx):
         imgs, labels, _, _, _ = batch
@@ -230,20 +220,26 @@ def initializer(M):
 
 
 
-CFG_FN = 'configs/yolox_m' 
+CFG_FN = 'configs/yolox_m.yaml' 
 
 
 def main():
     assert os.path.isfile(CFG_FN), f"Config file '{CFG_FN}' does not exist!"
     with open(CFG_FN, encoding='ascii', errors='ignore') as f:
         config = yaml.safe_load(f)
-        
-    model = YOLOXLit(configs)
-    data = PRWDataModule(configs)
+    config['dataset']['dir'] = '/kaggle/input/prwv16/coco'
+    config['dataset']['train'] = 'minitrain'
+    config['dataset']['val'] = 'minival'
+    config['dataset']['num_classes'] = 1
+    print(config)
+    model = YOLOXLit(config)
+    data = PRWDataModule(config)
+    #print(data.train_dataloader())
+    #print(data.val_dataloader())
     logger = CSVLogger("logs", name="csvlogger")
     
     seed_everything(42, workers=True)
-
+    
     trainer = Trainer(
         gpus=1,
         max_epochs=300,
@@ -268,7 +264,4 @@ def main():
     # trainer.tune(model, datamodule=data)
     # trainer.validate(model, datamodule=data)
     # trainer.test(model, datamodule=data)
-
-
-if __name__ == "__main__":
-    main()
+    
