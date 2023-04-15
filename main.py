@@ -27,6 +27,107 @@ from torch.utils.data.sampler import BatchSampler, RandomSampler
 import os
 import yaml
 
+import torchvision
+import numpy as np
+
+def xyxy2xywh(bboxes):
+    # Convert nx4 boxes from [x1, y1, x2, y2] to [x1, y1, w, h] where x1y1=top-left, x2y2=bottom-right
+    y = bboxes.clone() if isinstance(bboxes, torch.Tensor) else np.copy(bboxes)
+    y[:, 2] = bboxes[:, 2] - bboxes[:, 0]
+    y[:, 3] = bboxes[:, 3] - bboxes[:, 1]
+    return y
+
+
+def format_outputs(outputs, ids, hws, val_size, class_ids, labels):
+    """
+    outputs: [batch, [x1, y1, x2, y2, confidence, class_pred]]
+    """
+
+    json_list = []
+    # det_list (list[list]): shape(num_images, num_classes)
+    det_list = [[np.empty(shape=[0, 5]) for _ in range(len(class_ids))] for _ in range(len(outputs))]
+
+    # for each image
+    for i, (output, img_h, img_w, img_id) in enumerate(zip(outputs, hws[0], hws[1], ids)):
+        if output is None:
+            continue
+
+        bboxes = output[:, 0:4]
+        scale = min(val_size[0] / float(img_w), val_size[1] / float(img_h))
+        bboxes /= scale
+        coco_bboxes = xyxy2xywh(bboxes)
+
+        scores = output[:, 4]
+        clses = output[:, 5]
+
+        # COCO format follows the prediction
+        for bbox, cocobox, score, cls in zip(bboxes, coco_bboxes, scores, clses):
+            # COCO format
+            cls = int(cls)
+            class_id = class_ids[cls]
+            pred_data = {
+                "image_id": int(img_id),
+                "category_id": class_id,
+                "bbox": cocobox.cpu().numpy().tolist(),
+                "score": score.cpu().numpy().item(),
+                "segmentation": [],
+            }
+            json_list.append(pred_data)
+
+        # VOC format follows the class
+        for c in range(len(class_ids)):
+            # detection np.array(x1, y1, x2, y2, score)
+            det_ind = clses == c
+            detections = output[det_ind, 0:5]
+            det_list[i][c] = detections.cpu().numpy()
+
+    return json_list, 
+
+
+def postprocess(predictions, conf_thre=0.7, nms_thre=0.45, class_agnostic=False):
+    max_det = 300  # maximum number of detections per image
+    max_nms = 10000  # maximum number of boxes into torchvision.ops.nms()
+
+    output = [None for _ in range(predictions.shape[0])]
+    for i in range(predictions.shape[0]):
+        image_pred = predictions[i]
+        # If none are remaining => process next image
+        if not image_pred.shape[0]:
+            continue
+        # Get class and correspond score
+        class_conf, class_pred = torch.max(image_pred[:, 5:], 1, keepdim=True)
+        confidence = image_pred[:, 4] * class_conf.squeeze()
+        conf_mask = (confidence >= conf_thre).squeeze()
+        # Detections ordered as (x1, y1, x2, y2, confidence, class_pred)
+        detections = torch.cat((image_pred[:, :4], confidence.unsqueeze(-1), class_pred.float()), 1)
+        detections = detections[conf_mask]
+        if detections.shape[0] > max_nms:
+            detections = detections[:max_nms]
+        if not detections.size(0):
+            continue
+
+        if class_agnostic:
+            nms_out_index = torchvision.ops.nms(
+                detections[:, :4],
+                detections[:, 4],
+                nms_thre,
+            )
+        else:
+            nms_out_index = torchvision.ops.batched_nms(
+                detections[:, :4],
+                detections[:, 4],
+                detections[:, 5],
+                nms_thre,
+            )
+
+        detections = detections[nms_out_index]
+        if detections.shape[0] > max_det:  # limit detections
+            detections = detections[:max_det]
+        output[i] = detections
+
+    return output
+
+
 class PRWDataModule(pl.LightningDataModule):
     def __init__(self, cfgs):
         super().__init__()
@@ -38,6 +139,7 @@ class PRWDataModule(pl.LightningDataModule):
         self.data_dir = self.cd['dir']
         self.train_dir = self.cd['train']
         self.val_dir = self.cd['val']
+        self.test_dir = self.cd['test']
         self.img_size_train = tuple(self.cd['train_size'])
         self.img_size_val = tuple(self.cd['val_size'])
         self.train_batch_size = self.cd['train_batch_size']
@@ -98,7 +200,19 @@ class PRWDataModule(pl.LightningDataModule):
         val_loader = DataLoader(self.dataset_val, batch_size=self.val_batch_size, sampler=torch.utils.data.SequentialSampler(self.dataset_val),
                                 num_workers=6, pin_memory=True, shuffle=False)
         return val_loader
-
+    
+    def test_dataloader(self):
+        self.dataset_test = COCODataset(
+            self.data_dir,
+            name=self.test_dir,
+            img_size=self.img_size_val,
+            preprocess=ValTransform(legacy=False),
+            cache=False,
+        )
+        test_loader = DataLoader(self.dataset_test, batch_size=self.val_batch_size, shuffle=False,
+                                 num_workers=2, pin_memory=False, persistent_workers=False)
+        return test_loader
+        
 
 class YOLOXLit(LightningModule):
     def __init__(self, cfgs):
@@ -207,7 +321,29 @@ class YOLOXLit(LightningModule):
         average_ifer_time = torch.tensor(self.iter_times, dtype=torch.float32).mean()
         print("The average iference time is ", average_ifer_time, " ms")
         print("Best mAP = {:.3f}, best mAP50 = {:.3f}".format(self.ap50_95, self.ap50))
+    
+    def forward(self, imgs):
+        self.model.eval()
+        detections = self.model(imgs)
+        return detections
 
+    def test_step(self, batch, batch_idx):
+        imgs, labels, img_hw, image_id, img_name = batch
+        model = self.model
+        start_time = time.time()
+        detections = model(imgs, labels)
+        self.infr_times.append(time.time() - start_time)
+        start_time = time.time()
+        detections = postprocess(detections, self.test_conf, self.test_nms)
+        self.nms_times.append(time.time() - start_time)
+        json_det, det = format_outputs(detections, image_id, img_hw, self.img_size_val,
+                                       self.trainer.datamodule.dataset_test.class_ids, labels)
+        return json_det, det, imgs, img_name
+    
+    
+    
+    
+    
 
 def initializer(M):
     for m in M.modules():
@@ -215,53 +351,33 @@ def initializer(M):
             m.eps = 1e-3
             m.momentum = 0.03
 
-
-
-
-
-
-CFG_FN = 'configs/yolox_m.yaml' 
-
-
 def main():
+    CFG_FN = 'configs/yolox_m.yaml'
     assert os.path.isfile(CFG_FN), f"Config file '{CFG_FN}' does not exist!"
     with open(CFG_FN, encoding='ascii', errors='ignore') as f:
         config = yaml.safe_load(f)
     config['dataset']['dir'] = '/kaggle/input/prwv16/coco'
     config['dataset']['train'] = 'minitrain'
     config['dataset']['val'] = 'minival'
+    config['dataset']['test'] = 'test'
     config['dataset']['num_classes'] = 1
     print(config)
     model = YOLOXLit(config)
     data = PRWDataModule(config)
-    #print(data.train_dataloader())
-    #print(data.val_dataloader())
     logger = CSVLogger("logs", name="csvlogger")
-    
+
     seed_everything(42, workers=True)
-    
+
     trainer = Trainer(
         gpus=1,
-        max_epochs=300,
+        max_epochs=2,
         check_val_every_n_epoch=5,
         log_every_n_steps=10,
         enable_progress_bar=True,
-        logger=logger,
-        # precision=16,
-        # amp_backend="apex",
-        # amp_level=01,
-        # auto_lr_find=True,
-        # benchmark=False,
-        # callbacks=[device_stats],
-        # default_root_dir="lightning_logs",
-        # detect_anomaly=True,
-        # limit_train_batches=3,
-        # limit_val_batches=2,
-        # reload_dataloaders_every_n_epochs=10,
+        logger=logger
     )
 
     trainer.fit(model, datamodule=data)
-    # trainer.tune(model, datamodule=data)
-    # trainer.validate(model, datamodule=data)
-    # trainer.test(model, datamodule=data)
-    
+
+if __name__ == "__main__":
+    main()
