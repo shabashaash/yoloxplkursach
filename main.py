@@ -26,107 +26,139 @@ from torch.utils.data.sampler import BatchSampler, RandomSampler
 
 import os
 import yaml
-
-import torchvision
 import numpy as np
+import cv2
+import matplotlib.pyplot as plt
 
-def xyxy2xywh(bboxes):
-    # Convert nx4 boxes from [x1, y1, x2, y2] to [x1, y1, w, h] where x1y1=top-left, x2y2=bottom-right
-    y = bboxes.clone() if isinstance(bboxes, torch.Tensor) else np.copy(bboxes)
-    y[:, 2] = bboxes[:, 2] - bboxes[:, 0]
-    y[:, 3] = bboxes[:, 3] - bboxes[:, 1]
-    return y
+plt.rcParams["figure.figsize"] = (20,8)
+
+from collections import OrderedDict
 
 
-def format_outputs(outputs, ids, hws, val_size, class_ids, labels):
-    """
-    outputs: [batch, [x1, y1, x2, y2, confidence, class_pred]]
-    """
 
-    json_list = []
-    # det_list (list[list]): shape(num_images, num_classes)
-    det_list = [[np.empty(shape=[0, 5]) for _ in range(len(class_ids))] for _ in range(len(outputs))]
+_COLORS = np.array(
+    [
+        0.000, 0.447, 0.741,
+        0.850, 0.325, 0.098,
+        0.929, 0.694, 0.125,
+        0.494, 0.184, 0.556,
+        0.466, 0.674, 0.188,
+        0.301, 0.745, 0.933,
+        0.635, 0.078, 0.184,
+        0.300, 0.300, 0.300,
+        0.600, 0.600, 0.600,
+        1.000, 0.000, 0.000,
+        1.000, 0.500, 0.000,
+        0.749, 0.749, 0.000,
+        0.000, 1.000, 0.000,
+        0.000, 0.000, 1.000,
+        0.667, 0.000, 1.000,
+        0.333, 0.333, 0.000,
+        0.333, 0.667, 0.000,
+        0.333, 1.000, 0.000,
+        0.667, 0.333, 0.000,
+        0.667, 0.667, 0.000,
+        0.667, 1.000, 0.000,
+        1.000, 0.333, 0.000,
+        1.000, 0.667, 0.000,
+        1.000, 1.000, 0.000,
+        0.000, 0.333, 0.500,
+        0.000, 0.667, 0.500,
+        0.000, 1.000, 0.500,
+        0.333, 0.000, 0.500,
+        0.333, 0.333, 0.500,
+        0.333, 0.667, 0.500,
+        0.333, 1.000, 0.500,
+        0.667, 0.000, 0.500,
+        0.667, 0.333, 0.500,
+        0.667, 0.667, 0.500,
+        0.667, 1.000, 0.500,
+        1.000, 0.000, 0.500,
+        1.000, 0.333, 0.500,
+        1.000, 0.667, 0.500,
+        1.000, 1.000, 0.500,
+        0.000, 0.333, 1.000,
+        0.000, 0.667, 1.000,
+        0.000, 1.000, 1.000,
+        0.333, 0.000, 1.000,
+        0.333, 0.333, 1.000,
+        0.333, 0.667, 1.000,
+        0.333, 1.000, 1.000,
+        0.667, 0.000, 1.000,
+        0.667, 0.333, 1.000,
+        0.667, 0.667, 1.000,
+        0.667, 1.000, 1.000,
+        1.000, 0.000, 1.000,
+        1.000, 0.333, 1.000,
+        1.000, 0.667, 1.000,
+        0.333, 0.000, 0.000,
+        0.500, 0.000, 0.000,
+        0.667, 0.000, 0.000,
+        0.833, 0.000, 0.000,
+        1.000, 0.000, 0.000,
+        0.000, 0.167, 0.000,
+        0.000, 0.333, 0.000,
+        0.000, 0.500, 0.000,
+        0.000, 0.667, 0.000,
+        0.000, 0.833, 0.000,
+        0.000, 1.000, 0.000,
+        0.000, 0.000, 0.167,
+        0.000, 0.000, 0.333,
+        0.000, 0.000, 0.500,
+        0.000, 0.000, 0.667,
+        0.000, 0.000, 0.833,
+        0.000, 0.000, 1.000,
+        0.000, 0.000, 0.000,
+        0.143, 0.143, 0.143,
+        0.286, 0.286, 0.286,
+        0.429, 0.429, 0.429,
+        0.571, 0.571, 0.571,
+        0.714, 0.714, 0.714,
+        0.857, 0.857, 0.857,
+        0.000, 0.447, 0.741,
+        0.314, 0.717, 0.741,
+        0.50, 0.5, 0
+    ]
+).astype(np.float32).reshape(-1, 3)
 
-    # for each image
-    for i, (output, img_h, img_w, img_id) in enumerate(zip(outputs, hws[0], hws[1], ids)):
-        if output is None:
+def vis_image(img, boxes, scores, cls_ids, conf=0.5, class_names=None):
+    for i in range(len(boxes)):
+        box = boxes[i]
+        cls_id = int(cls_ids[i])
+        score = scores[i]
+        if score < conf:
             continue
+        x0 = int(box[0])
+        y0 = int(box[1])
+        x1 = int(box[0]+box[2])
+        y1 = int(box[1]+box[3])
 
-        bboxes = output[:, 0:4]
-        scale = min(val_size[0] / float(img_w), val_size[1] / float(img_h))
-        bboxes /= scale
-        coco_bboxes = xyxy2xywh(bboxes)
+        color = (_COLORS[cls_id] * 255).astype(np.uint8).tolist()
+        text = '{}:{:.1f}%'.format(class_names[cls_id], score * 100)
+        txt_color = (0, 0, 0) if np.mean(_COLORS[cls_id]) > 0.5 else (255, 255, 255)
+        font = cv2.FONT_HERSHEY_SIMPLEX
 
-        scores = output[:, 4]
-        clses = output[:, 5]
+        txt_size = cv2.getTextSize(text, font, 0.4, 1)[0]
+        cv2.rectangle(img, (x0, y0), (x1, y1), color, 2)
 
-        # COCO format follows the prediction
-        for bbox, cocobox, score, cls in zip(bboxes, coco_bboxes, scores, clses):
-            # COCO format
-            cls = int(cls)
-            class_id = class_ids[cls]
-            pred_data = {
-                "image_id": int(img_id),
-                "category_id": class_id,
-                "bbox": cocobox.cpu().numpy().tolist(),
-                "score": score.cpu().numpy().item(),
-                "segmentation": [],
-            }
-            json_list.append(pred_data)
+        txt_bk_color = (_COLORS[cls_id] * 255 * 0.7).astype(np.uint8).tolist()
+        cv2.rectangle(
+            img,
+            (x0, y0 + 1),
+            (x0 + txt_size[0] + 1, y0 + int(1.5*txt_size[1])),
+            txt_bk_color,
+            -1
+        )
+        
+        cv2.putText(img, text, (x0, y0+ txt_size[1]), font, 0.4, txt_color, thickness=1) #+ txt_size[1]
 
-        # VOC format follows the class
-        for c in range(len(class_ids)):
-            # detection np.array(x1, y1, x2, y2, score)
-            det_ind = clses == c
-            detections = output[det_ind, 0:5]
-            det_list[i][c] = detections.cpu().numpy()
+    return img
 
-    return json_list, 
-
-
-def postprocess(predictions, conf_thre=0.7, nms_thre=0.45, class_agnostic=False):
-    max_det = 300  # maximum number of detections per image
-    max_nms = 10000  # maximum number of boxes into torchvision.ops.nms()
-
-    output = [None for _ in range(predictions.shape[0])]
-    for i in range(predictions.shape[0]):
-        image_pred = predictions[i]
-        # If none are remaining => process next image
-        if not image_pred.shape[0]:
-            continue
-        # Get class and correspond score
-        class_conf, class_pred = torch.max(image_pred[:, 5:], 1, keepdim=True)
-        confidence = image_pred[:, 4] * class_conf.squeeze()
-        conf_mask = (confidence >= conf_thre).squeeze()
-        # Detections ordered as (x1, y1, x2, y2, confidence, class_pred)
-        detections = torch.cat((image_pred[:, :4], confidence.unsqueeze(-1), class_pred.float()), 1)
-        detections = detections[conf_mask]
-        if detections.shape[0] > max_nms:
-            detections = detections[:max_nms]
-        if not detections.size(0):
-            continue
-
-        if class_agnostic:
-            nms_out_index = torchvision.ops.nms(
-                detections[:, :4],
-                detections[:, 4],
-                nms_thre,
-            )
-        else:
-            nms_out_index = torchvision.ops.batched_nms(
-                detections[:, :4],
-                detections[:, 4],
-                detections[:, 5],
-                nms_thre,
-            )
-
-        detections = detections[nms_out_index]
-        if detections.shape[0] > max_det:  # limit detections
-            detections = detections[:max_det]
-        output[i] = detections
-
-    return output
-
+def initializer(M):
+    for m in M.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eps = 1e-3
+            m.momentum = 0.03
 
 class PRWDataModule(pl.LightningDataModule):
     def __init__(self, cfgs):
@@ -329,37 +361,53 @@ class YOLOXLit(LightningModule):
 
     def test_step(self, batch, batch_idx):
         imgs, labels, img_hw, image_id, img_name = batch
-        model = self.model
         start_time = time.time()
-        detections = model(imgs, labels)
-        self.infr_times.append(time.time() - start_time)
-        start_time = time.time()
-        detections = postprocess(detections, self.test_conf, self.test_nms)
-        self.nms_times.append(time.time() - start_time)
-        json_det, det = format_outputs(detections, image_id, img_hw, self.img_size_val,
-                                       self.trainer.datamodule.dataset_test.class_ids, labels)
-        return json_det, det, imgs, img_name
-    
-    
-    
-    
-    
-
-def initializer(M):
-    for m in M.modules():
-        if isinstance(m, nn.BatchNorm2d):
-            m.eps = 1e-3
-            m.momentum = 0.03
+        output = self.model(imgs)
+        detections = self.decoder(output, self.confidence_threshold, self.nms_threshold)
+        self.iter_times.append(time.time() - start_time)
+        json_det = convert_to_coco_format(detections, image_id, img_hw, self.img_size_val,
+                                            self.trainer.datamodule.dataset_val.class_ids)                
+        return json_det, imgs, img_name
+    def test_epoch_end(self, test_step_outputs) -> None:
+        json_dets = []
+        imgs = []
+        for json_, _, img_paths in test_step_outputs:
+            json_dets.extend(json_)
+            for img_path in img_paths:
+                imgs.append(cv2.imread('/kaggle/input/prwv16/frames/'+img_path))
+            
+        vis_data = {}
+        i = 0
+        
+        for row in json_dets:
+            if row['image_id'] in vis_data.keys():
+                vis_data[row['image_id']]['boxes'].append(row['bbox'])
+                vis_data[row['image_id']]['scores'].append(row['score'])
+                vis_data[row['image_id']]['cls_ids'].append(row['category_id'])
+            else:
+                vis_data[row['image_id']] = {}
+                vis_data[row['image_id']]['img'] = imgs[i]
+                vis_data[row['image_id']]['boxes'] = []
+                vis_data[row['image_id']]['scores'] = []
+                vis_data[row['image_id']]['cls_ids'] = []
+                i+=1
+        #cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        for img_id in vis_data:
+            img, boxes, scores, cls_ids = vis_data[img_id].values()
+            res_img = vis_image(img, boxes, scores, cls_ids, class_names = ["none","pedestrian"])
+            plt.imshow(res_img.astype('uint8'))
+            plt.show()
+            
+  
 
 def main():
     CFG_FN = 'configs/yolox_m.yaml'
-    assert os.path.isfile(CFG_FN), f"Config file '{CFG_FN}' does not exist!"
     with open(CFG_FN, encoding='ascii', errors='ignore') as f:
         config = yaml.safe_load(f)
     config['dataset']['dir'] = '/kaggle/input/prwv16/coco'
     config['dataset']['train'] = 'minitrain'
     config['dataset']['val'] = 'minival'
-    config['dataset']['test'] = 'test'
+    config['dataset']['test'] = 'minival'
     config['dataset']['num_classes'] = 1
     print(config)
     model = YOLOXLit(config)
@@ -370,7 +418,7 @@ def main():
 
     trainer = Trainer(
         gpus=1,
-        max_epochs=2,
+        max_epochs=150,
         check_val_every_n_epoch=5,
         log_every_n_steps=10,
         enable_progress_bar=True,
@@ -378,6 +426,20 @@ def main():
     )
 
     trainer.fit(model, datamodule=data)
+    #trainer.save_checkpoint("model.ckpt")
+    model = YOLOXLit(config)
 
-if __name__ == "__main__":
-    main()
+    state_dict = OrderedDict({
+        k.replace('model.', ''):v
+        for k,v in torch.load('logs/csvlogger/version_0/checkpoints/epoch=149-step=1050.ckpt', map_location='cuda:0')["state_dict"].items()
+    })
+
+    model.model.load_state_dict(state_dict)
+
+    trainer = Trainer(
+        max_epochs=1,
+        num_sanity_val_steps=0,
+        devices=1,
+        accelerator="auto"
+    )
+    trainer.test(model, datamodule=data)
